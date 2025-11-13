@@ -42,6 +42,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+// Load GitHub updater
+require_once plugin_dir_path( __FILE__ ) . 'includes/class-github-updater.php';
+
 class MasterStudy_Search_API {
 
 	/**
@@ -1092,7 +1095,14 @@ class MasterStudy_Search_API {
 
 // Initialize the plugin
 function masterstudy_search_api_init() {
-	return MasterStudy_Search_API::get_instance();
+	$instance = MasterStudy_Search_API::get_instance();
+	
+	// Initialize GitHub updater
+	if ( is_admin() ) {
+		new MasterStudy_Search_API_GitHub_Updater( __FILE__ );
+	}
+	
+	return $instance;
 }
 
 // Hook into plugins_loaded to ensure MasterStudy is loaded first
