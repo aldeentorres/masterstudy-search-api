@@ -16,6 +16,7 @@ This plugin extends the MasterStudy LMS API with enhanced search capabilities. I
 - Automatic course-lesson relationship detection
 - **Category filtering** - Filter by MasterStudy course categories (e.g., countries)
 - **Category-only filtering** - Get all courses/lessons from a specific category without search term
+- **Agent progress endpoint** - Fetch completed and ongoing courses/lessons for any LMS user (agent)
 
 Perfect for external applications, mobile apps, and third-party integrations.
 
@@ -48,6 +49,11 @@ Returns courses with optional search, filtering, and sorting capabilities.
 
 Returns both courses and lessons with search, filtering, and sorting capabilities.
 
+### 3. Agent Progress Endpoint
+**Base URL:** `/wp-json/masterstudy-lms/v2/agent-progress`
+
+Returns the courses and lessons an agent has completed or is still working on, grouped by status.
+
 ## API Parameters
 
 ### Common Parameters
@@ -60,6 +66,14 @@ Returns both courses and lessons with search, filtering, and sorting capabilitie
 | `page` | integer | No | 1 | Page number for pagination |
 | `sort` | string | No | - | Sort order (see Sort Options below) |
 | `author` | integer | No | - | Filter by instructor/author ID |
+
+### Agent Progress Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `agent_id` | string | Yes | - | User identifier. Accepts numeric ID, email address, or username. |
+| `status` | string | No | `all` | Filter results by bucket: `all`, `completed`, or `ongoing`. |
+| `include_lessons` | boolean | No | `true` | Set to `false` to exclude lesson progress (courses only). |
 
 ### Sort Options
 
@@ -167,6 +181,23 @@ GET /wp-json/masterstudy-lms/v2/courses?per_page=20&page=2
 GET /wp-json/masterstudy-lms/v2/search?category=168&s=marketing&per_page=20&page=1&sort=rating
 ```
 
+### Agent Progress Usage
+
+**Fetch all course and lesson progress for an agent (providing email):**
+```
+GET /wp-json/masterstudy-lms/v2/agent-progress?agent_id=abudi@iqiglobal.com
+```
+
+**Fetch only ongoing items using username:**
+```
+GET /wp-json/masterstudy-lms/v2/agent-progress?agent_id=abudi&status=ongoing
+```
+
+**Fetch courses only (no lessons) using numeric user ID:**
+```
+GET /wp-json/masterstudy-lms/v2/agent-progress?agent_id=123&include_lessons=false
+```
+
 ### Filter by Author
 
 **Get courses by specific instructor:**
@@ -256,6 +287,62 @@ GET /wp-json/masterstudy-lms/v2/courses?author=5&s=javascript
 ```
 
 **Note:** The search endpoint always returns both courses and lessons (when applicable).
+
+### Agent Progress Endpoint Response
+
+```json
+{
+  "agent_id": 123,
+  "status_filter": "all",
+  "course_threshold": 70,
+  "summary": {
+    "courses": {
+      "completed": 3,
+      "ongoing": 2
+    },
+    "lessons": {
+      "completed": 15,
+      "ongoing": 4
+    }
+  },
+  "courses": {
+    "completed": [
+      {
+        "id": 321,
+        "title": "Advanced Sales",
+        "progress_percent": 95,
+        "status": "completed",
+        "current_lesson": null
+      }
+    ],
+    "ongoing": [
+      {
+        "id": 654,
+        "title": "Negotiation Fundamentals",
+        "progress_percent": 45,
+        "status": "ongoing",
+        "current_lesson": {
+          "id": 987,
+          "title": "Roleplay Session",
+          "link": "https://example.com/courses/negotiation/987/"
+        }
+      }
+    ]
+  },
+  "lessons": {
+    "completed": [
+      {
+        "id": 555,
+        "title": "Lesson Title",
+        "course_id": 321,
+        "progress": 100,
+        "status": "completed"
+      }
+    ],
+    "ongoing": []
+  }
+}
+```
 
 ## Response Fields
 

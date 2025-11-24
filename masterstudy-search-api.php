@@ -87,6 +87,7 @@ class MasterStudy_Search_API {
 		
 		// Register combined courses and lessons search endpoint
 		add_action( 'rest_api_init', array( $this, 'register_combined_search_endpoint' ) );
+		add_action( 'rest_api_init', array( $this, 'register_agent_progress_endpoint' ) );
 	}
 
 	/**
@@ -937,6 +938,391 @@ class MasterStudy_Search_API {
 		}
 
 		return new WP_REST_Response( $results, 200 );
+	}
+
+
+	/**
+	 * Register agent progress endpoint.
+	 */
+	public function register_agent_progress_endpoint() {
+		register_rest_route(
+			'masterstudy-lms/v2',
+			'/agent-progress',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_agent_progress' ),
+				'permission_callback' => '__return_true',
+				'args'                => array(
+					'agent_id'       => array(
+						'required'          => true,
+						'type'              => 'string',
+						'sanitize_callback' => 'sanitize_text_field',
+						'description'       => 'Agent identifier: accepts user ID, email address, or username.',
+					),
+					'status'         => array(
+						'required'    => false,
+						'type'        => 'string',
+						'default'     => 'all',
+						'enum'        => array( 'all', 'completed', 'ongoing' ),
+						'description' => 'Filter response to a specific status bucket.',
+					),
+					'include_lessons' => array(
+						'required'    => false,
+						'type'        => 'boolean',
+						'default'     => true,
+						'description' => 'Whether to include lesson progress data.',
+					),
+				),
+			)
+		);
+	}
+
+	/**
+	 * Return agent progress grouped by status.
+	 *
+	 * @param WP_REST_Request $request REST request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function get_agent_progress( $request ) {
+		$agent_identifier = $request->get_param( 'agent_id' );
+
+		if ( empty( $agent_identifier ) ) {
+			return new WP_Error(
+				'invalid_agent_id',
+				esc_html__( 'A valid agent_id parameter is required.', 'masterstudy-search-api' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$agent = $this->resolve_agent_user( $agent_identifier );
+
+		if ( ! $agent ) {
+			return new WP_Error(
+				'agent_not_found',
+				esc_html__( 'Agent not found.', 'masterstudy-search-api' ),
+				array( 'status' => 404 )
+			);
+		}
+
+		$agent_id        = intval( $agent->ID );
+		$status          = $request->get_param( 'status' ) ?: 'all';
+		$include_lessons = $request->get_param( 'include_lessons' );
+		$include_lessons = is_null( $include_lessons ) ? true : rest_sanitize_boolean( $include_lessons );
+		$course_threshold = $this->get_course_completion_threshold();
+
+		try {
+			$courses = $this->get_agent_courses_progress( $agent_id, $course_threshold );
+			$lessons = $include_lessons ? $this->get_agent_lessons_progress( $agent_id ) : array(
+				'completed' => array(),
+				'ongoing'   => array(),
+			);
+		} catch ( Exception $e ) {
+			return new WP_Error(
+				'agent_progress_error',
+				esc_html__( 'Unable to load agent progress.', 'masterstudy-search-api' ),
+				array(
+					'status'  => 500,
+					'details' => $e->getMessage(),
+				)
+			);
+		}
+
+		$summary = array(
+			'courses' => array(
+				'completed' => count( $courses['completed'] ),
+				'ongoing'   => count( $courses['ongoing'] ),
+			),
+			'lessons' => array(
+				'completed' => $include_lessons ? count( $lessons['completed'] ) : 0,
+				'ongoing'   => $include_lessons ? count( $lessons['ongoing'] ) : 0,
+			),
+		);
+
+		$response = array(
+			'agent_id'         => $agent_id,
+			'status_filter'    => $status,
+			'course_threshold' => $course_threshold,
+			'courses'          => $this->filter_progress_sets( $courses, $status ),
+			'lessons'          => $include_lessons ? $this->filter_progress_sets( $lessons, $status ) : array(),
+			'summary'          => $summary,
+		);
+
+		return new WP_REST_Response( $response, 200 );
+	}
+
+	/**
+	 * Filter progress buckets by requested status.
+	 *
+	 * @param array  $data   Progress buckets.
+	 * @param string $status Requested status.
+	 * @return array
+	 */
+	private function filter_progress_sets( $data, $status ) {
+		if ( 'completed' === $status ) {
+			return array(
+				'completed' => $data['completed'],
+				'ongoing'   => array(),
+			);
+		}
+
+		if ( 'ongoing' === $status ) {
+			return array(
+				'completed' => array(),
+				'ongoing'   => $data['ongoing'],
+			);
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Resolve agent identifier to WP_User.
+	 *
+	 * @param string $identifier Agent identifier (ID, email, or username).
+	 * @return WP_User|false
+	 */
+	private function resolve_agent_user( $identifier ) {
+		$identifier = trim( (string) $identifier );
+
+		if ( '' === $identifier ) {
+			return false;
+		}
+
+		// Numeric user ID.
+		if ( is_numeric( $identifier ) ) {
+			$user = get_user_by( 'ID', intval( $identifier ) );
+			if ( $user ) {
+				return $user;
+			}
+		}
+
+		// Email address lookup.
+		if ( function_exists( 'is_email' ) && is_email( $identifier ) ) {
+			$user = get_user_by( 'email', $identifier );
+			if ( $user ) {
+				return $user;
+			}
+		}
+
+		// Fallback to username/login check.
+		return get_user_by( 'login', $identifier );
+	}
+
+	/**
+	 * Get course completion threshold from MasterStudy settings.
+	 *
+	 * @return int
+	 */
+	private function get_course_completion_threshold() {
+		if ( class_exists( 'STM_LMS_Options' ) && method_exists( 'STM_LMS_Options', 'get_option' ) ) {
+			return intval( \STM_LMS_Options::get_option( 'certificate_threshold', 70 ) );
+		}
+
+		return 70;
+	}
+
+	/**
+	 * Fetch agent courses grouped by completion status.
+	 *
+	 * @param int $agent_id Agent user ID.
+	 * @param int $completion_threshold Completion threshold percent.
+	 * @return array
+	 */
+	private function get_agent_courses_progress( $agent_id, $completion_threshold ) {
+		global $wpdb;
+
+		$table = $this->get_user_courses_table();
+
+		$query = $wpdb->prepare(
+			"SELECT uc.*, p.post_title, p.post_excerpt, p.post_content, p.post_author, p.post_date
+			FROM {$table} uc
+			INNER JOIN {$wpdb->posts} p ON p.ID = uc.course_id
+			WHERE uc.user_id = %d
+				AND p.post_type = 'stm-courses'
+				AND p.post_status IN ('publish','private')
+			ORDER BY uc.user_course_id DESC",
+			$agent_id
+		);
+
+		$rows = $wpdb->get_results( $query );
+
+		$data = array(
+			'completed' => array(),
+			'ongoing'   => array(),
+		);
+
+		if ( empty( $rows ) ) {
+			return $data;
+		}
+
+		foreach ( $rows as $row ) {
+			$item      = $this->format_course_progress_item( $row, $completion_threshold );
+			$progress  = intval( $row->progress_percent );
+			$bucket    = ( $progress >= $completion_threshold ) ? 'completed' : 'ongoing';
+			$data[ $bucket ][] = $item;
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Format a single course progress item.
+	 *
+	 * @param stdClass $row Course row.
+	 * @param int      $completion_threshold Threshold percent.
+	 * @return array
+	 */
+	private function format_course_progress_item( $row, $completion_threshold ) {
+		$course_id     = intval( $row->course_id );
+		$progress      = intval( $row->progress_percent );
+		$status        = ( $progress >= $completion_threshold ) ? 'completed' : 'ongoing';
+		$current_lesson_id = intval( $row->current_lesson_id );
+
+		$current_lesson = null;
+		if ( $current_lesson_id > 0 ) {
+			$current_lesson = array(
+				'id'    => $current_lesson_id,
+				'title' => get_the_title( $current_lesson_id ) ?: '',
+				'link'  => $this->get_lesson_url( $current_lesson_id, $course_id ),
+			);
+		}
+
+		$item = array(
+			'id'               => $course_id,
+			'title'            => $row->post_title,
+			'excerpt'          => wp_trim_words( $row->post_excerpt ?: $row->post_content, 20 ),
+			'link'             => get_permalink( $course_id ),
+			'type'             => 'course',
+			'date'             => $row->post_date,
+			'author'           => intval( $row->post_author ),
+			'author_name'      => get_the_author_meta( 'display_name', $row->post_author ),
+			'progress_percent' => $progress,
+			'status'           => $status,
+			'start_time'       => intval( $row->start_time ),
+			'end_time'         => intval( $row->end_time ),
+			'current_lesson'   => $current_lesson,
+		);
+
+		if ( class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
+			try {
+				$repo        = new \MasterStudy\Lms\Repositories\CourseRepository();
+				$full_course = $repo->find( $course_id, 'grid' );
+
+				if ( $full_course ) {
+					$item['price']    = $full_course->price ?? 0;
+					$item['rating']   = $full_course->rating ?? 0;
+					$item['students'] = $full_course->current_students ?? 0;
+					$item['thumbnail'] = $full_course->image ?? '';
+				}
+			} catch ( Exception $e ) {
+				// Continue without repository data.
+			}
+		}
+
+		return $item;
+	}
+
+	/**
+	 * Fetch agent lessons grouped by completion status.
+	 *
+	 * @param int $agent_id Agent user ID.
+	 * @return array
+	 */
+	private function get_agent_lessons_progress( $agent_id ) {
+		global $wpdb;
+
+		$table = $this->get_user_lessons_table();
+
+		$query = $wpdb->prepare(
+			"SELECT ul.*, l.post_title, l.post_excerpt, l.post_content, l.post_author, l.post_date
+			FROM {$table} ul
+			INNER JOIN {$wpdb->posts} l ON l.ID = ul.lesson_id
+			WHERE ul.user_id = %d
+				AND l.post_type = 'stm-lessons'
+				AND l.post_status = 'publish'
+			ORDER BY ul.user_lesson_id DESC",
+			$agent_id
+		);
+
+		$rows = $wpdb->get_results( $query );
+
+		$data = array(
+			'completed' => array(),
+			'ongoing'   => array(),
+		);
+
+		if ( empty( $rows ) ) {
+			return $data;
+		}
+
+		foreach ( $rows as $row ) {
+			$item     = $this->format_lesson_progress_item( $row );
+			$progress = is_null( $row->progress ) ? 0 : intval( $row->progress );
+			$bucket   = ( $progress >= 100 || intval( $row->end_time ) > 0 ) ? 'completed' : 'ongoing';
+			$data[ $bucket ][] = $item;
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Format a single lesson progress record.
+	 *
+	 * @param stdClass $row Lesson row.
+	 * @return array
+	 */
+	private function format_lesson_progress_item( $row ) {
+		$lesson_id = intval( $row->lesson_id );
+		$course_id = intval( $row->course_id );
+		$progress  = is_null( $row->progress ) ? 0 : intval( $row->progress );
+
+		return array(
+			'id'              => $lesson_id,
+			'title'           => $row->post_title,
+			'excerpt'         => wp_trim_words( $row->post_excerpt ?: $row->post_content, 20 ),
+			'link'            => $this->get_lesson_url( $lesson_id, $course_id ),
+			'type'            => 'lesson',
+			'date'            => $row->post_date,
+			'author'          => intval( $row->post_author ),
+			'author_name'     => get_the_author_meta( 'display_name', $row->post_author ),
+			'course_id'       => $course_id,
+			'course_title'    => get_the_title( $course_id ) ?: '',
+			'course_link'     => get_permalink( $course_id ),
+			'progress'        => $progress,
+			'status'          => ( $progress >= 100 || intval( $row->end_time ) > 0 ) ? 'completed' : 'ongoing',
+			'start_time'      => intval( $row->start_time ),
+			'end_time'        => intval( $row->end_time ),
+		);
+	}
+
+	/**
+	 * Get user courses table name with fallback.
+	 *
+	 * @return string
+	 */
+	private function get_user_courses_table() {
+		global $wpdb;
+
+		if ( function_exists( 'stm_lms_user_courses_name' ) ) {
+			return stm_lms_user_courses_name( $wpdb );
+		}
+
+		return $wpdb->prefix . 'stm_lms_user_courses';
+	}
+
+	/**
+	 * Get user lessons table name with fallback.
+	 *
+	 * @return string
+	 */
+	private function get_user_lessons_table() {
+		global $wpdb;
+
+		if ( function_exists( 'stm_lms_user_lessons_name' ) ) {
+			return stm_lms_user_lessons_name( $wpdb );
+		}
+
+		return $wpdb->prefix . 'stm_lms_user_lessons';
 	}
 
 	/**
