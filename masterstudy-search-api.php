@@ -3,7 +3,7 @@
  * Plugin Name: MasterStudy Search API
  * Plugin URI: https://github.com/aldeentorres/masterstudy-search-api
  * Description: Enhanced search API for MasterStudy LMS with powerful search capabilities. Makes courses and lessons searchable via REST API. Includes case-insensitive partial matching for courses and lessons, category filtering, and category-only filtering. Perfect for external applications, mobile apps, and third-party integrations.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: artor
  * Author URI: https://github.com/aldeentorres
  * License: GPL v2 or later
@@ -50,7 +50,7 @@ class MasterStudy_Search_API {
 	/**
 	 * Plugin version
 	 */
-	const VERSION = '1.0.0';
+	const VERSION = '1.1.0';
 
 	/**
 	 * Instance of this class
