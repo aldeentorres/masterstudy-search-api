@@ -201,18 +201,91 @@ class MasterStudy_Search_API {
 			$response_data = $response->get_data();
 			}
 			
-			// If there's a search term, also include lessons
+			// If there's a search term, find matching lessons and group them by course
 			$search_term = $request->get_param( 's' );
-			if ( ! empty( $search_term ) ) {
+			if ( ! empty( $search_term ) && is_array( $response_data ) ) {
+				// Get ALL matching lessons (no pagination - we'll paginate courses later)
+				$lessons = $this->search_lessons( $search_term, 1000, $category, 0 );
+				
+				// Group lessons by course ID
+				$lessons_by_course = $this->group_lessons_by_course( $lessons );
+				
+				// Get all unique course IDs that have matching lessons
+				$lesson_course_ids = array_keys( $lessons_by_course );
+				
+				// Get courses that contain matching lessons
+				$courses_from_lessons = array();
+				if ( ! empty( $lesson_course_ids ) ) {
+					$courses_from_lessons = $this->get_courses_by_ids( $lesson_course_ids, $category );
+				}
+				
+				// Build a map of existing courses by ID
+				$existing_courses_map = array();
+				if ( ! empty( $response_data['courses'] ) ) {
+					foreach ( $response_data['courses'] as $course ) {
+						$course_id = $course['id'] ?? 0;
+						$existing_courses_map[ $course_id ] = $course;
+					}
+				}
+				
+				// Merge courses from lessons with existing courses and add lessons to each
+				foreach ( $courses_from_lessons as $course ) {
+					$course_id = $course['id'];
+					if ( ! isset( $existing_courses_map[ $course_id ] ) ) {
+						$existing_courses_map[ $course_id ] = $course;
+					}
+					// Add matching lessons to this course
+					if ( isset( $lessons_by_course[ $course_id ] ) ) {
+						$existing_courses_map[ $course_id ]['lessons'] = $lessons_by_course[ $course_id ];
+					}
+				}
+				
+				// Also add lessons to courses that matched directly
+				foreach ( $existing_courses_map as $course_id => $course ) {
+					if ( isset( $lessons_by_course[ $course_id ] ) ) {
+						$existing_courses_map[ $course_id ]['lessons'] = $lessons_by_course[ $course_id ];
+					} elseif ( ! isset( $existing_courses_map[ $course_id ]['lessons'] ) ) {
+						$existing_courses_map[ $course_id ]['lessons'] = array();
+					}
+				}
+				
+				// Get pagination and sort parameters
 				$per_page = intval( $request->get_param( 'per_page' ) ) ?: 10;
 				$page = intval( $request->get_param( 'page' ) ) ?: 1;
-				$offset = $per_page * ( $page - 1 );
-				$lessons = $this->search_lessons( $search_term, $per_page, $category, $offset );
+				$sort = $request->get_param( 'sort' );
 				
-				// Add lessons to the response
-				if ( is_array( $response_data ) ) {
-					$response_data['lessons'] = $lessons;
-					$response_data['total'] = ( $response_data['total'] ?? 0 ) + count( $lessons );
+				// Apply sorting if requested
+				if ( ! empty( $sort ) ) {
+					// Accept both MasterStudy defaults and user-friendly names
+					$supported_sorts = array( 'date_high', 'date_low', 'newest', 'oldest', 'price_high', 'price_low', 'rating', 'popular' );
+					if ( in_array( strtolower( $sort ), $supported_sorts, true ) ) {
+						$sorted_courses = $this->sort_courses_array( array_values( $existing_courses_map ), $sort );
+						$existing_courses_map = array();
+						foreach ( $sorted_courses as $course ) {
+							$existing_courses_map[ $course['id'] ] = $course;
+						}
+					}
+				}
+				
+				// Convert to array and apply pagination
+				$all_courses = array_values( $existing_courses_map );
+				$total_courses = count( $all_courses );
+				$offset = $per_page * ( $page - 1 );
+				$paginated_courses = array_slice( $all_courses, $offset, $per_page );
+				
+				// Update response with paginated courses
+				$response_data['courses'] = $paginated_courses;
+				// Remove separate lessons array if it exists
+				unset( $response_data['lessons'] );
+				// Update total and pages
+				$response_data['total'] = $total_courses;
+				$response_data['pages'] = ceil( $total_courses / $per_page );
+			} elseif ( is_array( $response_data ) ) {
+				// Ensure all courses have an empty lessons array when no search term
+				if ( ! empty( $response_data['courses'] ) ) {
+					foreach ( $response_data['courses'] as &$course ) {
+						$course['lessons'] = array();
+					}
 				}
 			}
 			
@@ -382,6 +455,7 @@ class MasterStudy_Search_API {
 					'type'     => 'course',
 					'date'     => $course->post_date,
 					'author'   => intval( $course->post_author ),
+					'lessons'  => array(), // Initialize with empty lessons array
 				);
 
 				// Add course-specific data if available
@@ -404,10 +478,10 @@ class MasterStudy_Search_API {
 		}
 
 		// Apply sorting if requested
-		if ( ! empty( $sort ) && class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
-			$sort_mapping = \MasterStudy\Lms\Repositories\CourseRepository::SORT_MAPPING;
-			
-			if ( isset( $sort_mapping[ $sort ] ) ) {
+		if ( ! empty( $sort ) ) {
+			// Accept both MasterStudy defaults and user-friendly names
+			$supported_sorts = array( 'date_high', 'date_low', 'newest', 'oldest', 'price_high', 'price_low', 'rating', 'popular' );
+			if ( in_array( strtolower( $sort ), $supported_sorts, true ) ) {
 				$sorted_courses = $this->get_sorted_courses( $search_term, $sort, $per_page, $offset, $request->get_param( 'category' ) );
 				if ( ! empty( $sorted_courses ) ) {
 					$formatted_courses = $sorted_courses;
@@ -784,27 +858,18 @@ class MasterStudy_Search_API {
 		$courses_where_sql = implode( ' AND ', $courses_where );
 
 		// Search courses (case-insensitive, partial match in title and content)
+		// Get ALL courses first (no pagination - we'll paginate after merging with courses from lessons)
 		$courses_query = $wpdb->prepare(
 			"SELECT DISTINCT p.ID, p.post_title, p.post_content, p.post_excerpt, p.post_date, p.post_author
 			FROM $courses_from
 			WHERE $courses_where_sql
-			ORDER BY p.post_date DESC
-			LIMIT %d OFFSET %d",
-			...array_merge( $courses_params, array( $per_page, $offset ) )
+			ORDER BY p.post_date DESC",
+			...$courses_params
 		);
 
 		$courses = $wpdb->get_results( $courses_query );
 
-		// Get total courses count
-		$courses_count_query = $wpdb->prepare(
-			"SELECT COUNT(DISTINCT p.ID) 
-			FROM $courses_from
-			WHERE $courses_where_sql",
-			...$courses_params
-		);
-		$courses_total = intval( $wpdb->get_var( $courses_count_query ) );
-
-		// Format courses
+		// Format courses (without lessons array - they're separate in search endpoint)
 		foreach ( $courses as $course ) {
 			$course_data = array(
 				'id'       => intval( $course->ID ),
@@ -835,107 +900,72 @@ class MasterStudy_Search_API {
 		}
 
 		// Search lessons (case-insensitive, partial match in title and content)
-		// Use the same search_lessons method which handles category filtering
-		// Only search lessons if there's a search term, otherwise just filter by category
+		// Get ALL matching lessons (no pagination limit for now)
 		if ( ! empty( $search_term ) ) {
-			$lessons = $this->search_lessons( $search_term, $per_page, $category, $offset );
+			$lessons = $this->search_lessons( $search_term, 1000, $category, 0 );
 		} else {
 			// If no search term but category is provided, get all lessons from that category
-			$lessons = $this->get_lessons_by_category( $category, $per_page, $offset );
+			$lessons = $this->get_lessons_by_category( $category, 1000, 0 );
+		}
+
+		// Enhance lessons with course information
+		$enhanced_lessons = array();
+		foreach ( $lessons as $lesson ) {
+			$primary_course_id = $lesson['course_id'] ?? null;
+			
+			// Add course information to lesson
+			$enhanced_lesson = $lesson;
+			if ( ! empty( $primary_course_id ) ) {
+				$enhanced_lesson['course_link'] = get_permalink( $primary_course_id );
+				$enhanced_lesson['course_title'] = get_the_title( $primary_course_id ) ?: '';
+			} else {
+				$enhanced_lesson['course_link'] = '';
+				$enhanced_lesson['course_title'] = '';
+			}
+			
+			$enhanced_lessons[] = $enhanced_lesson;
+		}
+
+		// Get sort parameter
+		$sort = $request->get_param( 'sort' );
+
+		// Apply sorting to courses if requested
+		if ( ! empty( $sort ) ) {
+			$supported_sorts = array( 'date_high', 'date_low', 'newest', 'oldest', 'price_high', 'price_low', 'rating', 'popular' );
+			if ( in_array( strtolower( $sort ), $supported_sorts, true ) ) {
+				$results['courses'] = $this->sort_courses_array( $results['courses'], $sort );
+			}
+		}
+
+		// Apply pagination - courses and lessons are paginated together
+		// First courses, then lessons, up to per_page total items
+		$total_courses = count( $results['courses'] );
+		$total_lessons = count( $enhanced_lessons );
+		$total_items = $total_courses + $total_lessons;
+		
+		$offset = $per_page * ( $page - 1 );
+		
+		// Paginate courses first
+		$courses_to_show = min( $per_page, $total_courses - $offset );
+		if ( $courses_to_show > 0 && $offset < $total_courses ) {
+			$results['courses'] = array_slice( $results['courses'], $offset, $courses_to_show );
+		} else {
+			$results['courses'] = array();
 		}
 		
-		// Get total lessons count with category filter
-		// Reuse the same logic as search_lessons but for count
-		$lessons_where = array(
-			"l.post_type = 'stm-lessons'",
-			"l.post_status = 'publish'",
-		);
-
-		$lessons_params = array();
-		$lessons_from = "{$wpdb->posts} l";
-
-		// Add search filter if provided
-		if ( ! empty( $search_term ) ) {
-			$search_like = '%' . $wpdb->esc_like( $search_term ) . '%';
-			$lessons_where[] = "(
-				LOWER(l.post_title) LIKE %s
-				OR LOWER(l.post_content) LIKE %s
-				OR LOWER(l.post_excerpt) LIKE %s
-			)";
-			$lessons_params = array( $search_like, $search_like, $search_like );
+		// Remaining slots for lessons
+		$remaining_slots = $per_page - count( $results['courses'] );
+		$lessons_offset = max( 0, $offset - $total_courses );
+		
+		if ( $remaining_slots > 0 && $lessons_offset < $total_lessons ) {
+			$results['lessons'] = array_slice( $enhanced_lessons, $lessons_offset, $remaining_slots );
+		} else {
+			$results['lessons'] = array();
 		}
 
-		// Add category filter for lessons if provided
-		if ( ! empty( $category ) ) {
-			$category_ids = $this->parse_category_parameter( $category );
-			
-			if ( ! empty( $category_ids ) ) {
-				$curriculum_table = $wpdb->prefix . 'stm_lms_curriculum_materials';
-				$sections_table = $wpdb->prefix . 'stm_lms_curriculum_sections';
-				
-				// Check if tables exist
-				$materials_table_exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $curriculum_table ) );
-				$sections_table_exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $sections_table ) );
-				
-				if ( $materials_table_exists && $sections_table_exists ) {
-					$category_placeholders = implode( ',', array_fill( 0, count( $category_ids ), '%d' ) );
-					
-					// Join with curriculum tables and course categories
-					$lessons_from .= "
-						INNER JOIN {$curriculum_table} m ON l.ID = m.post_id
-						INNER JOIN {$sections_table} s ON m.section_id = s.id
-						INNER JOIN {$wpdb->posts} c ON s.course_id = c.ID
-						INNER JOIN {$wpdb->term_relationships} tr ON c.ID = tr.object_id
-						INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
-					";
-					
-					$lessons_where[] = "m.post_type = 'stm-lessons'";
-					$lessons_where[] = "c.post_type = 'stm-courses'";
-					$lessons_where[] = "c.post_status = 'publish'";
-					$lessons_where[] = "tt.taxonomy = 'stm_lms_course_taxonomy'";
-					$lessons_where[] = "tt.term_id IN ($category_placeholders)";
-					
-					$lessons_params = array_merge( $lessons_params, $category_ids );
-				} else {
-					// If curriculum tables don't exist, no lessons can be filtered by category
-					$lessons_total = 0;
-				}
-			}
-		}
-
-		// Get total lessons count
-		if ( ! isset( $lessons_total ) ) {
-			$lessons_where_sql = implode( ' AND ', $lessons_where );
-			
-		$lessons_count_query = $wpdb->prepare(
-				"SELECT COUNT(DISTINCT l.ID) 
-				FROM $lessons_from
-				WHERE $lessons_where_sql",
-				...$lessons_params
-		);
-		$lessons_total = intval( $wpdb->get_var( $lessons_count_query ) );
-		}
-
-		// Lessons are already formatted by search_lessons method
-		$results['lessons'] = $lessons;
-
-		// Calculate totals
-		$results['total'] = $courses_total + $lessons_total;
-		$results['pages'] = ceil( max( $courses_total, $lessons_total ) / $per_page );
-
-		// Apply sorting if requested (only affects courses)
-		if ( ! empty( $request->get_param( 'sort' ) ) && class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
-			$sort = $request->get_param( 'sort' );
-			$sort_mapping = \MasterStudy\Lms\Repositories\CourseRepository::SORT_MAPPING;
-			
-			if ( isset( $sort_mapping[ $sort ] ) ) {
-				// Re-fetch courses with sorting
-				$sorted_courses = $this->get_sorted_courses( $search_term, $sort, $per_page, $offset, $category );
-				if ( ! empty( $sorted_courses ) ) {
-					$results['courses'] = $sorted_courses;
-				}
-			}
-		}
+		// Calculate totals (courses + lessons)
+		$results['total'] = $total_items;
+		$results['pages'] = ceil( $total_items / $per_page );
 
 		return new WP_REST_Response( $results, 200 );
 	}
@@ -1326,6 +1356,132 @@ class MasterStudy_Search_API {
 	}
 
 	/**
+	 * Group lessons by their course IDs
+	 *
+	 * @param array $lessons Array of lesson data.
+	 * @return array Array keyed by course ID, each containing an array of lessons.
+	 */
+	private function group_lessons_by_course( $lessons ) {
+		$grouped = array();
+		
+		foreach ( $lessons as $lesson ) {
+			$course_ids = array();
+			
+			// Get all course IDs this lesson belongs to
+			if ( ! empty( $lesson['courses'] ) && is_array( $lesson['courses'] ) ) {
+				$course_ids = $lesson['courses'];
+			} elseif ( ! empty( $lesson['course_id'] ) ) {
+				$course_ids = array( $lesson['course_id'] );
+			}
+			
+			// Remove lesson-specific fields that shouldn't be in the nested lesson object
+			$lesson_data = $lesson;
+			unset( $lesson_data['course_id'] );
+			unset( $lesson_data['courses'] );
+			
+			// Add lesson to each course it belongs to
+			foreach ( $course_ids as $course_id ) {
+				if ( ! isset( $grouped[ $course_id ] ) ) {
+					$grouped[ $course_id ] = array();
+				}
+				$grouped[ $course_id ][] = $lesson_data;
+			}
+		}
+		
+		return $grouped;
+	}
+
+	/**
+	 * Get courses by their IDs
+	 *
+	 * @param array  $course_ids Array of course IDs.
+	 * @param string $category Optional category filter (IDs/names/slugs, comma-separated).
+	 * @return array Array of formatted course data.
+	 */
+	private function get_courses_by_ids( $course_ids, $category = null ) {
+		if ( empty( $course_ids ) ) {
+			return array();
+		}
+
+		global $wpdb;
+
+		// Build query
+		$placeholders = implode( ',', array_fill( 0, count( $course_ids ), '%d' ) );
+		$from_clause = "{$wpdb->posts} p";
+		$where_clauses = array(
+			"p.post_type = 'stm-courses'",
+			"p.post_status = 'publish'",
+			"p.ID IN ($placeholders)",
+		);
+		$query_params = $course_ids;
+
+		// Add category filter if provided
+		if ( ! empty( $category ) ) {
+			$category_ids = $this->parse_category_parameter( $category );
+			
+			if ( ! empty( $category_ids ) ) {
+				$category_placeholders = implode( ',', array_fill( 0, count( $category_ids ), '%d' ) );
+				
+				$from_clause .= " 
+					INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+					INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+				";
+				
+				$where_clauses[] = "tt.taxonomy = 'stm_lms_course_taxonomy'";
+				$where_clauses[] = "tt.term_id IN ($category_placeholders)";
+				
+				$query_params = array_merge( $query_params, $category_ids );
+			}
+		}
+
+		$where_sql = implode( ' AND ', $where_clauses );
+
+		$courses_query = $wpdb->prepare(
+			"SELECT DISTINCT p.ID, p.post_title, p.post_content, p.post_excerpt, p.post_date, p.post_author
+			FROM $from_clause
+			WHERE $where_sql
+			ORDER BY p.post_date DESC",
+			...$query_params
+		);
+
+		$courses = $wpdb->get_results( $courses_query );
+
+		// Format courses
+		$formatted = array();
+		foreach ( $courses as $course ) {
+			$course_data = array(
+				'id'       => intval( $course->ID ),
+				'title'    => $course->post_title,
+				'excerpt'  => wp_trim_words( $course->post_excerpt ?: $course->post_content, 20 ),
+				'link'     => get_permalink( $course->ID ),
+				'type'     => 'course',
+				'date'     => $course->post_date,
+				'author'   => intval( $course->post_author ),
+				'lessons'  => array(), // Initialize with empty lessons array
+			);
+
+			// Add course-specific data if available
+			if ( class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
+				try {
+					$repo = new \MasterStudy\Lms\Repositories\CourseRepository();
+					$full_course = $repo->find( $course->ID, 'grid' );
+					if ( $full_course ) {
+						$course_data['price'] = $full_course->price ?? 0;
+						$course_data['rating'] = $full_course->rating ?? 0;
+						$course_data['students'] = $full_course->current_students ?? 0;
+					}
+				} catch ( Exception $e ) {
+					// Continue without additional data
+				}
+			}
+
+			$formatted[] = $course_data;
+		}
+
+		return $formatted;
+	}
+
+	/**
 	 * Get courses that contain a specific lesson
 	 *
 	 * @param int $lesson_id Lesson ID.
@@ -1427,6 +1583,112 @@ class MasterStudy_Search_API {
 	}
 
 	/**
+	 * Sort an array of courses by the specified sort type
+	 *
+	 * @param array  $courses Array of course data.
+	 * @param string $sort Sort type.
+	 * @return array Sorted courses array.
+	 */
+	private function sort_courses_array( $courses, $sort ) {
+		if ( empty( $courses ) || empty( $sort ) ) {
+			return $courses;
+		}
+
+		// Normalize user-friendly sort names to MasterStudy format
+		$sort_aliases = array(
+			'newest' => 'date_high',
+			'oldest' => 'date_low',
+		);
+		
+		if ( isset( $sort_aliases[ strtolower( $sort ) ] ) ) {
+			$sort = $sort_aliases[ strtolower( $sort ) ];
+		}
+
+		// Supported sort values (MasterStudy defaults + our additions)
+		$supported_sorts = array( 'date_high', 'date_low', 'price_high', 'price_low', 'rating', 'popular' );
+		
+		// Check if sort is supported (either in SORT_MAPPING or in our custom list)
+		$is_supported = false;
+		if ( class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
+			$sort_mapping = \MasterStudy\Lms\Repositories\CourseRepository::SORT_MAPPING;
+			$is_supported = isset( $sort_mapping[ $sort ] );
+		}
+		
+		// Also check our custom supported list (for date_high which might not be in SORT_MAPPING)
+		if ( ! $is_supported && in_array( $sort, $supported_sorts, true ) ) {
+			$is_supported = true;
+		}
+		
+		if ( ! $is_supported ) {
+			return $courses;
+		}
+
+		// Sort based on type
+		switch ( $sort ) {
+			case 'date_high':
+				// Newest first (date descending)
+				usort( $courses, function( $a, $b ) {
+					$date_a = strtotime( $a['date'] ?? '' );
+					$date_b = strtotime( $b['date'] ?? '' );
+					return $date_b <=> $date_a;
+				} );
+				break;
+
+			case 'date_low':
+				// Oldest first (date ascending)
+				usort( $courses, function( $a, $b ) {
+					$date_a = strtotime( $a['date'] ?? '' );
+					$date_b = strtotime( $b['date'] ?? '' );
+					return $date_a <=> $date_b;
+				} );
+				break;
+
+			case 'price_high':
+				usort( $courses, function( $a, $b ) {
+					$price_a = floatval( $a['price'] ?? 0 );
+					$price_b = floatval( $b['price'] ?? 0 );
+					return $price_b <=> $price_a;
+				} );
+				break;
+
+			case 'price_low':
+				usort( $courses, function( $a, $b ) {
+					$price_a = floatval( $a['price'] ?? 0 );
+					$price_b = floatval( $b['price'] ?? 0 );
+					return $price_a <=> $price_b;
+				} );
+				break;
+
+			case 'rating':
+				usort( $courses, function( $a, $b ) {
+					$rating_a = floatval( $a['rating'] ?? 0 );
+					$rating_b = floatval( $b['rating'] ?? 0 );
+					return $rating_b <=> $rating_a;
+				} );
+				break;
+
+			case 'popular':
+				usort( $courses, function( $a, $b ) {
+					$students_a = intval( $a['students'] ?? 0 );
+					$students_b = intval( $b['students'] ?? 0 );
+					return $students_b <=> $students_a;
+				} );
+				break;
+
+			default:
+				// Default: newest first (date descending)
+				usort( $courses, function( $a, $b ) {
+					$date_a = strtotime( $a['date'] ?? '' );
+					$date_b = strtotime( $b['date'] ?? '' );
+					return $date_b <=> $date_a;
+				} );
+				break;
+		}
+
+		return $courses;
+	}
+
+	/**
 	 * Get sorted courses with search
 	 *
 	 * @param string $search_term Search term.
@@ -1439,6 +1701,16 @@ class MasterStudy_Search_API {
 	private function get_sorted_courses( $search_term, $sort, $per_page, $offset, $category = null ) {
 		if ( ! class_exists( '\MasterStudy\Lms\Repositories\CourseRepository' ) ) {
 			return array();
+		}
+
+		// Normalize user-friendly sort names to MasterStudy format
+		$sort_aliases = array(
+			'newest' => 'date_high',
+			'oldest' => 'date_low',
+		);
+		
+		if ( isset( $sort_aliases[ strtolower( $sort ) ] ) ) {
+			$sort = $sort_aliases[ strtolower( $sort ) ];
 		}
 
 		try {
@@ -1469,6 +1741,7 @@ class MasterStudy_Search_API {
 					'price'    => $course->price ?? 0,
 					'rating'   => $course->rating ?? 0,
 					'students' => $course->current_students ?? 0,
+					'lessons'  => array(), // Initialize with empty lessons array
 				);
 			}
 			
