@@ -201,6 +201,19 @@ class MasterStudy_Search_API {
 			$response_data = $response->get_data();
 			}
 			
+			// Convert courses from objects to arrays if needed
+			if ( ! empty( $response_data['courses'] ) && is_array( $response_data['courses'] ) ) {
+				$converted_courses = array();
+				foreach ( $response_data['courses'] as $course ) {
+					// Convert object to array if needed
+					if ( is_object( $course ) ) {
+						$course = (array) $course;
+					}
+					$converted_courses[] = $course;
+				}
+				$response_data['courses'] = $converted_courses;
+			}
+			
 			// If there's a search term, find matching lessons and group them by course
 			$search_term = $request->get_param( 's' );
 			if ( ! empty( $search_term ) && is_array( $response_data ) ) {
@@ -223,25 +236,42 @@ class MasterStudy_Search_API {
 				$existing_courses_map = array();
 				if ( ! empty( $response_data['courses'] ) ) {
 					foreach ( $response_data['courses'] as $course ) {
-						$course_id = $course['id'] ?? 0;
+						// Ensure course is an array
+						if ( is_object( $course ) ) {
+							$course = (array) $course;
+						}
+						$course_id = $course['id'] ?? ( isset( $course->id ) ? $course->id : 0 );
 						$existing_courses_map[ $course_id ] = $course;
 					}
 				}
 				
 				// Merge courses from lessons with existing courses and add lessons to each
 				foreach ( $courses_from_lessons as $course ) {
-					$course_id = $course['id'];
+					// Ensure course is an array
+					if ( is_object( $course ) ) {
+						$course = (array) $course;
+					}
+					$course_id = $course['id'] ?? 0;
 					if ( ! isset( $existing_courses_map[ $course_id ] ) ) {
 						$existing_courses_map[ $course_id ] = $course;
 					}
 					// Add matching lessons to this course
 					if ( isset( $lessons_by_course[ $course_id ] ) ) {
+						// Ensure the course in the map is an array
+						if ( is_object( $existing_courses_map[ $course_id ] ) ) {
+							$existing_courses_map[ $course_id ] = (array) $existing_courses_map[ $course_id ];
+						}
 						$existing_courses_map[ $course_id ]['lessons'] = $lessons_by_course[ $course_id ];
 					}
 				}
 				
 				// Also add lessons to courses that matched directly
 				foreach ( $existing_courses_map as $course_id => $course ) {
+					// Ensure course is an array
+					if ( is_object( $course ) ) {
+						$course = (array) $course;
+						$existing_courses_map[ $course_id ] = $course;
+					}
 					if ( isset( $lessons_by_course[ $course_id ] ) ) {
 						$existing_courses_map[ $course_id ]['lessons'] = $lessons_by_course[ $course_id ];
 					} elseif ( ! isset( $existing_courses_map[ $course_id ]['lessons'] ) ) {
@@ -257,12 +287,18 @@ class MasterStudy_Search_API {
 				// Apply sorting if requested
 				if ( ! empty( $sort ) ) {
 					// Accept both MasterStudy defaults and user-friendly names
+					// Note: 'relevance' is not directly supported but will be ignored gracefully
 					$supported_sorts = array( 'date_high', 'date_low', 'newest', 'oldest', 'price_high', 'price_low', 'rating', 'popular' );
 					if ( in_array( strtolower( $sort ), $supported_sorts, true ) ) {
 						$sorted_courses = $this->sort_courses_array( array_values( $existing_courses_map ), $sort );
 						$existing_courses_map = array();
 						foreach ( $sorted_courses as $course ) {
-							$existing_courses_map[ $course['id'] ] = $course;
+							// Ensure course is an array
+							if ( is_object( $course ) ) {
+								$course = (array) $course;
+							}
+							$course_id = $course['id'] ?? 0;
+							$existing_courses_map[ $course_id ] = $course;
 						}
 					}
 				}
@@ -284,6 +320,10 @@ class MasterStudy_Search_API {
 				// Ensure all courses have an empty lessons array when no search term
 				if ( ! empty( $response_data['courses'] ) ) {
 					foreach ( $response_data['courses'] as &$course ) {
+						// Convert object to array if needed
+						if ( is_object( $course ) ) {
+							$course = (array) $course;
+						}
 						$course['lessons'] = array();
 					}
 				}
@@ -1622,6 +1662,14 @@ class MasterStudy_Search_API {
 		if ( ! $is_supported ) {
 			return $courses;
 		}
+
+		// Convert all courses to arrays if they are objects
+		$courses = array_map( function( $course ) {
+			if ( is_object( $course ) ) {
+				return (array) $course;
+			}
+			return $course;
+		}, $courses );
 
 		// Sort based on type
 		switch ( $sort ) {
